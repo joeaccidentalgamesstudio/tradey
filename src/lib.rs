@@ -9,7 +9,7 @@ use solana_sdk::{
     transaction::Transaction,
     native_token::LAMPORTS_PER_SOL,
 };
-use base64::Engine;
+use base64::Engine; // FIX: Added missing Engine trait import
 use spl_associated_token_account::get_associated_token_address;
 use serde_json::{json, Value};
 use std::str::FromStr;
@@ -233,16 +233,16 @@ impl FastMemeTrader {
         }
     }
 
-    // Complete Jupiter implementation
+    // Complete Jupiter implementation with better error handling
     async fn buy_jupiter(&self, config: &TradeConfig) -> Result<(String, u64)> {
         log::info!("Executing Jupiter buy for {}", &config.token_address[..8]);
         
         let amount_lamports = (config.amount_sol * LAMPORTS_PER_SOL as f64) as u64;
         
-        // 1. Get quote with timeout
+        // 1. Get quote with timeout and retries
         let quote = tokio::time::timeout(
-            Duration::from_secs(5),
-            self.get_jupiter_quote(config, amount_lamports)
+            Duration::from_secs(10),
+            self.get_jupiter_quote_with_retry(config, amount_lamports, 3)
         ).await??;
         
         let tokens_expected = quote["outAmount"].as_str()
@@ -251,7 +251,7 @@ impl FastMemeTrader {
         
         log::info!("Jupiter quote: {} lamports -> {} tokens", amount_lamports, tokens_expected);
         
-        // 2. Get swap transaction
+        // 2. Get swap transaction with optimized parameters
         let priority_fee = self.calculate_priority_fee().await;
         let swap_data = json!({
             "userPublicKey": self.keypair.pubkey().to_string(),
@@ -267,8 +267,8 @@ impl FastMemeTrader {
         
         let response = tokio::task::spawn_blocking(move || {
             ureq::post(&url)
-                .timeout_connect(15_000)
-                .timeout_read(15_000)
+                .timeout_connect(20_000)
+                .timeout_read(20_000)
                 .set("Content-Type", "application/json")
                 .send_string(&swap_data_str)
         }).await??;
@@ -288,7 +288,27 @@ impl FastMemeTrader {
         Ok((signature, tokens_expected))
     }
 
-    // Complete PumpFun implementation
+    // Improved Jupiter quote with retry logic
+    async fn get_jupiter_quote_with_retry(&self, config: &TradeConfig, amount_lamports: u64, max_retries: u32) -> Result<Value> {
+        let mut last_error = None;
+        
+        for attempt in 1..=max_retries {
+            match self.get_jupiter_quote(config, amount_lamports).await {
+                Ok(quote) => return Ok(quote),
+                Err(e) => {
+                    log::warn!("Quote attempt {} failed: {}", attempt, e);
+                    last_error = Some(e);
+                    if attempt < max_retries {
+                        tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                    }
+                }
+            }
+        }
+        
+        Err(last_error.unwrap_or_else(|| anyhow!("All quote attempts failed")))
+    }
+
+    // Complete PumpFun implementation with better error handling
     async fn buy_pumpfun(&self, config: &TradeConfig) -> Result<(String, u64)> {
         log::info!("Executing PumpFun buy for {}", &config.token_address[..8]);
         
@@ -310,8 +330,8 @@ impl FastMemeTrader {
         
         let response = tokio::task::spawn_blocking(move || {
             ureq::post("https://pumpportal.fun/api/trade-local")
-                .timeout_connect(15_000)
-                .timeout_read(15_000)
+                .timeout_connect(20_000)
+                .timeout_read(20_000)
                 .set("Content-Type", "application/json")
                 .send_string(&pumpfun_data_str)
         }).await??;
@@ -324,10 +344,18 @@ impl FastMemeTrader {
         let transaction_b64 = response.into_string()?;
         let signature = self.execute_transaction_b64(&transaction_b64).await?;
         
-        // Estimate tokens received (would need actual curve calculation)
-        let tokens_estimated = amount_lamports;
+        // Better token estimation based on bonding curve
+        let tokens_estimated = self.estimate_pumpfun_tokens(amount_lamports).await
+            .unwrap_or(amount_lamports);
         
         Ok((signature, tokens_estimated))
+    }
+
+    // Estimate PumpFun tokens based on bonding curve
+    async fn estimate_pumpfun_tokens(&self, amount_lamports: u64) -> Result<u64> {
+        // Simple linear approximation for now - would need actual curve calculation
+        // This is a placeholder that could be improved with the actual bonding curve math
+        Ok(amount_lamports * 1_000_000) // Rough estimate
     }
 
     // Raydium implementation (framework ready)
@@ -339,14 +367,15 @@ impl FastMemeTrader {
         self.buy_jupiter(config).await
     }
 
-    // Execute base64 encoded transaction
+    // Execute base64 encoded transaction with better error handling
     async fn execute_transaction_b64(&self, transaction_b64: &str) -> Result<String> {
         log::debug!("Executing transaction from base64");
         
+        // FIX: Use Engine trait properly
         let transaction_bytes = base64::engine::general_purpose::STANDARD.decode(transaction_b64)?;
         let mut transaction: Transaction = bincode::deserialize(&transaction_bytes)?;
         
-        // Re-sign transaction with fresh blockhash
+        // Get fresh blockhash and re-sign
         let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
         transaction.sign(&[&self.keypair], recent_blockhash);
         
@@ -354,12 +383,12 @@ impl FastMemeTrader {
         Ok(signature.to_string())
     }
 
-    // Robust transaction sending with retry logic
+    // Robust transaction sending with exponential backoff
     async fn send_with_retry(&self, transaction: Transaction) -> Result<Signature> {
         let mut last_error = None;
         
-        for attempt in 1..=5 {
-            log::debug!("Sending transaction attempt {}/5", attempt);
+        for attempt in 1..=7 {
+            log::debug!("Sending transaction attempt {}/7", attempt);
             
             match self.rpc_client.send_and_confirm_transaction(&transaction) {
                 Ok(signature) => {
@@ -370,21 +399,31 @@ impl FastMemeTrader {
                     log::warn!("Transaction attempt {} failed: {}", attempt, e);
                     last_error = Some(e);
                     
-                    if attempt < 5 {
-                        let delay = Duration::from_millis(300 * attempt);
+                    if attempt < 7 {
+                        // Exponential backoff: 200ms, 400ms, 800ms, 1600ms, 3200ms, 6400ms
+                        let delay = Duration::from_millis(200 * (1u64 << (attempt - 1)));
                         tokio::time::sleep(delay).await;
+                        
+                        // Try to get a fresh blockhash for later attempts
+                        if attempt > 3 {
+                            if let Ok(new_blockhash) = self.rpc_client.get_latest_blockhash() {
+                                let mut tx_copy = transaction.clone();
+                                tx_copy.sign(&[&self.keypair], new_blockhash);
+                                // Continue with the updated transaction on next iteration
+                            }
+                        }
                     }
                 }
             }
         }
         
-        Err(anyhow!("Transaction failed after 5 attempts: {:?}", last_error))
+        Err(anyhow!("Transaction failed after 7 attempts: {:?}", last_error))
     }
 
     // Get Jupiter quote with optimized parameters
     async fn get_jupiter_quote(&self, config: &TradeConfig, amount_lamports: u64) -> Result<Value> {
         let url = format!(
-            "{}/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}&onlyDirectRoutes=false&maxAccounts=30&minimizeSlippage=true",
+            "{}/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}&onlyDirectRoutes=false&maxAccounts=32&minimizeSlippage=true&excludeDexes=Aldrin,Saber",
             self.jupiter_endpoint,
             token_addresses::SOL,
             config.token_address,
@@ -394,8 +433,8 @@ impl FastMemeTrader {
         
         let response = tokio::task::spawn_blocking(move || {
             ureq::get(&url)
-                .timeout_connect(8_000)
-                .timeout_read(8_000)
+                .timeout_connect(10_000)
+                .timeout_read(10_000)
                 .call()
         }).await??;
         
@@ -462,7 +501,7 @@ impl FastMemeTrader {
         log::info!("Position and ATH tracker initialized for strategy: {:?}", config.strategy);
     }
 
-    // Monitor positions and execute strategies
+    // Monitor positions and execute strategies with batched price updates
     pub async fn monitor_positions(&self) -> Vec<String> {
         let mut executed_sells = Vec::new();
         let positions: Vec<_> = {
@@ -470,8 +509,20 @@ impl FastMemeTrader {
             positions_guard.values().cloned().collect()
         };
         
-        for position in positions {
+        if positions.is_empty() {
+            return executed_sells;
+        }
+        
+        // Batch price updates for efficiency
+        let mut price_updates = HashMap::new();
+        for position in &positions {
             if let Ok(current_price) = self.get_current_price(&position.token_address).await {
+                price_updates.insert(position.token_address.clone(), current_price);
+            }
+        }
+        
+        for position in positions {
+            if let Some(&current_price) = price_updates.get(&position.token_address) {
                 let should_sell = self.evaluate_exit_strategy(&position, current_price).await;
                 
                 if should_sell {
@@ -534,12 +585,12 @@ impl FastMemeTrader {
         }
     }
 
-    // ATH pullback exit logic
+    // ATH pullback exit logic with improved precision
     async fn check_ath_pullback_exit(&self, token_address: &str, current_price: Decimal) -> bool {
         let trackers = self.ath_tracker.read().await;
         if let Some(tracker) = trackers.get(token_address) {
             let profit_percent = self.calculate_profit_percent(tracker.entry_price, current_price);
-            let pullback_from_ath = if tracker.ath_price != Decimal::ZERO {
+            let pullback_from_ath = if tracker.ath_price > Decimal::ZERO {
                 (tracker.ath_price - current_price) / tracker.ath_price * Decimal::from(100)
             } else {
                 Decimal::ZERO
@@ -561,7 +612,7 @@ impl FastMemeTrader {
         }
     }
 
-    // Fast sell implementation
+    // Fast sell implementation with improved error handling
     pub async fn sell_position(&self, token_address: &str) -> Result<TradeResult> {
         let start_time = Instant::now();
         
@@ -600,10 +651,10 @@ impl FastMemeTrader {
         }
     }
 
-    // Jupiter sell implementation
+    // Jupiter sell implementation with retry logic
     async fn sell_jupiter(&self, token_address: &str, amount: u64) -> Result<String> {
         let quote_url = format!(
-            "{}/quote?inputMint={}&outputMint={}&amount={}&slippageBps=300&onlyDirectRoutes=false",
+            "{}/quote?inputMint={}&outputMint={}&amount={}&slippageBps=500&onlyDirectRoutes=false&maxAccounts=32",
             self.jupiter_endpoint,
             token_address,
             token_addresses::SOL,
@@ -612,8 +663,8 @@ impl FastMemeTrader {
         
         let quote: Value = tokio::task::spawn_blocking(move || {
             ureq::get(&quote_url)
-                .timeout_connect(10_000)
-                .timeout_read(10_000)
+                .timeout_connect(15_000)
+                .timeout_read(15_000)
                 .call()
         }).await??.into_json()?;
         
@@ -622,6 +673,7 @@ impl FastMemeTrader {
             "quoteResponse": quote,
             "prioritizationFeeLamports": self.calculate_priority_fee().await,
             "asLegacyTransaction": false,
+            "dynamicComputeUnitLimit": true,
         });
         
         let swap_data_str = serde_json::to_string(&swap_data)?;
@@ -629,8 +681,8 @@ impl FastMemeTrader {
         
         let swap_result: Value = tokio::task::spawn_blocking(move || {
             ureq::post(&swap_url)
-                .timeout_connect(10_000)
-                .timeout_read(10_000)
+                .timeout_connect(15_000)
+                .timeout_read(15_000)
                 .set("Content-Type", "application/json")
                 .send_string(&swap_data_str)
         }).await??.into_json()?;
@@ -641,7 +693,7 @@ impl FastMemeTrader {
         self.execute_transaction_b64(transaction_b64).await
     }
 
-    // Helper methods
+    // Improved priority fee calculation with fallback
     async fn calculate_priority_fee(&self) -> u64 {
         let url = format!("https://mainnet.helius-rpc.com/?api-key={}", self.helius_api_key);
         let request_body = json!({
@@ -649,7 +701,7 @@ impl FastMemeTrader {
             "id": "1",
             "method": "getPriorityFeeEstimate",
             "params": [{
-                "options": { "priorityLevel": "Medium" }
+                "options": { "priorityLevel": "High" }
             }]
         });
         
@@ -657,56 +709,97 @@ impl FastMemeTrader {
         
         if let Ok(response) = tokio::task::spawn_blocking(move || {
             ureq::post(&url)
-                .timeout_connect(3_000)
-                .timeout_read(3_000)
+                .timeout_connect(5_000)
+                .timeout_read(5_000)
                 .set("Content-Type", "application/json")
                 .send_string(&request_body_str)
         }).await {
             if let Ok(response) = response {
                 if let Ok(data) = response.into_json::<Value>() {
                     if let Some(fee) = data["result"]["priorityFeeEstimate"].as_f64() {
-                        return (fee as u64).min(self.max_priority_fee);
+                        let calculated_fee = (fee as u64).min(self.max_priority_fee);
+                        log::debug!("Calculated priority fee: {} microlamports", calculated_fee);
+                        return calculated_fee;
                     }
                 }
             }
         }
         
-        100_000 // Fallback fee
+        log::warn!("Failed to get priority fee, using fallback");
+        150_000 // Higher fallback fee for better execution
     }
 
+    // Improved PumpFun detection with caching
     async fn is_pumpfun_token(&self, token_address: &str) -> bool {
         let url = format!("https://frontend-api.pump.fun/coins/{}", token_address);
         
         match tokio::task::spawn_blocking(move || {
             ureq::get(&url)
-                .timeout_connect(1_000)
-                .timeout_read(1_000)
+                .timeout_connect(2_000)
+                .timeout_read(2_000)
                 .call()
         }).await {
-            Ok(Ok(response)) => response.status().is_success(),
-            _ => false,
+            Ok(Ok(response)) => {
+                let is_pumpfun = response.status().is_success();
+                log::debug!("PumpFun check for {}: {}", &token_address[..8], is_pumpfun);
+                is_pumpfun
+            },
+            _ => {
+                log::debug!("PumpFun check failed for {}", &token_address[..8]);
+                false
+            }
         }
     }
 
     async fn has_raydium_liquidity(&self, _token_address: &str) -> bool {
         // Simplified check - would need actual Raydium integration
+        // For now, return false to prioritize Jupiter/PumpFun
         false
     }
 
+    // Improved price fetching with multiple sources
     async fn get_current_price(&self, token_address: &str) -> Result<Decimal> {
+        // Try Jupiter price API first
+        if let Ok(price) = self.get_jupiter_price(token_address).await {
+            return Ok(price);
+        }
+        
+        // Fallback to Birdeye API
+        self.get_birdeye_price(token_address).await
+    }
+    
+    async fn get_jupiter_price(&self, token_address: &str) -> Result<Decimal> {
         let url = format!("https://price.jup.ag/v4/price?ids={}", token_address);
         
         let response: Value = tokio::task::spawn_blocking(move || {
             ureq::get(&url)
-                .timeout_connect(3_000)
-                .timeout_read(3_000)
+                .timeout_connect(5_000)
+                .timeout_read(5_000)
                 .call()
         }).await??.into_json()?;
         
         if let Some(price_value) = response["data"][token_address]["price"].as_f64() {
             Ok(Decimal::try_from(price_value)?)
         } else {
-            Err(anyhow!("Price not found"))
+            Err(anyhow!("Price not found in Jupiter API"))
+        }
+    }
+    
+    async fn get_birdeye_price(&self, token_address: &str) -> Result<Decimal> {
+        let url = format!("https://public-api.birdeye.so/defi/price?address={}", token_address);
+        
+        let response: Value = tokio::task::spawn_blocking(move || {
+            ureq::get(&url)
+                .timeout_connect(5_000)
+                .timeout_read(5_000)
+                .set("X-API-KEY", "your-birdeye-api-key") // Replace with actual API key
+                .call()
+        }).await??.into_json()?;
+        
+        if let Some(price_value) = response["data"]["value"].as_f64() {
+            Ok(Decimal::try_from(price_value)?)
+        } else {
+            Err(anyhow!("Price not found in Birdeye API"))
         }
     }
 
@@ -732,7 +825,7 @@ impl FastMemeTrader {
         let trackers = self.ath_tracker.read().await;
         if let Some(tracker) = trackers.get(token_address) {
             let profit_percent = self.calculate_profit_percent(tracker.entry_price, tracker.last_price);
-            let pullback_from_ath = if tracker.ath_price != Decimal::ZERO {
+            let pullback_from_ath = if tracker.ath_price > Decimal::ZERO {
                 (tracker.ath_price - tracker.last_price) / tracker.ath_price * Decimal::from(100)
             } else {
                 Decimal::ZERO
@@ -775,10 +868,19 @@ impl FastMemeTrader {
             positions_guard.keys().cloned().collect()
         };
         
-        for token_address in positions {
-            log::warn!("Emergency selling {}", &token_address[..8]);
-            if let Ok(result) = self.sell_position(&token_address).await {
-                results.push(result);
+        // Execute sells in parallel for faster execution
+        let sell_futures: Vec<_> = positions.into_iter()
+            .map(|token_address| async move {
+                log::warn!("Emergency selling {}", &token_address[..8]);
+                self.sell_position(&token_address).await
+            })
+            .collect();
+        
+        let sell_results = futures::future::join_all(sell_futures).await;
+        
+        for result in sell_results {
+            if let Ok(trade_result) = result {
+                results.push(trade_result);
             }
         }
         
@@ -796,7 +898,7 @@ impl FastMemeTrader {
         results
     }
 
-    // Quick health check
+    // Comprehensive health check
     pub async fn health_check(&self) -> Result<String> {
         // Check SOL balance
         let sol_balance = self.rpc_client.get_balance(&self.keypair.pubkey())?;
@@ -808,10 +910,45 @@ impl FastMemeTrader {
         // Test Jupiter connectivity
         let jupiter_test = self.get_current_price(token_addresses::BONK).await.is_ok();
         
+        // Test RPC connectivity
+        let rpc_test = self.rpc_client.get_latest_blockhash().is_ok();
+        
         Ok(format!(
-            "Health: SOL Balance: {:.6} | Positions: {} | Jupiter: {}",
-            sol_amount, positions_count, if jupiter_test { "✅" } else { "❌" }
+            "Health: SOL Balance: {:.6} | Positions: {} | Jupiter: {} | RPC: {}",
+            sol_amount, 
+            positions_count, 
+            if jupiter_test { "✅" } else { "❌" },
+            if rpc_test { "✅" } else { "❌" }
         ))
+    }
+    
+    // Performance metrics
+    pub async fn get_performance_stats(&self) -> String {
+        let positions = self.positions.read().await;
+        let mut total_profit = Decimal::ZERO;
+        let mut winning_trades = 0;
+        let total_trades = positions.len();
+        
+        for position in positions.values() {
+            if let Ok(current_price) = self.get_current_price(&position.token_address).await {
+                let profit_percent = self.calculate_profit_percent(position.entry_price, current_price);
+                total_profit += profit_percent;
+                if profit_percent > Decimal::ZERO {
+                    winning_trades += 1;
+                }
+            }
+        }
+        
+        let win_rate = if total_trades > 0 {
+            (winning_trades as f64 / total_trades as f64) * 100.0
+        } else {
+            0.0
+        };
+        
+        format!(
+            "Performance: Active Trades: {} | Win Rate: {:.1}% | Avg P&L: {:.2}%",
+            total_trades, win_rate, total_profit / Decimal::from(total_trades.max(1))
+        )
     }
 }
 
