@@ -1,0 +1,851 @@
+// src/lib.rs - Complete Fast Solana Meme Trading Bot
+// Ultra-fast trading with ATH pullback strategies
+
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::{
+    signature::{Keypair, Signature, Signer},
+    pubkey::Pubkey,
+    commitment_config::CommitmentConfig,
+    transaction::Transaction,
+    native_token::LAMPORTS_PER_SOL,
+};
+use base64::Engine;
+use spl_associated_token_account::get_associated_token_address;
+use serde_json::{json, Value};
+use std::str::FromStr;
+use std::time::{Duration, Instant};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use rust_decimal::Decimal;
+use chrono::{DateTime, Utc};
+use anyhow::{anyhow, Result};
+
+// Main trading bot structure
+pub struct FastMemeTrader {
+    pub rpc_client: RpcClient,
+    pub keypair: Keypair,
+    pub helius_api_key: String,
+    jupiter_endpoint: String,
+    max_priority_fee: u64,
+    
+    // Strategy tracking
+    pub positions: Arc<RwLock<HashMap<String, Position>>>,
+    ath_tracker: Arc<RwLock<HashMap<String, ATHTracker>>>,
+    
+    // Program IDs for direct DEX interaction
+    jupiter_program_id: Pubkey,
+    raydium_amm_program_id: Pubkey,
+    pumpfun_program_id: Pubkey,
+}
+
+#[derive(Debug, Clone)]
+pub struct Position {
+    pub token_address: String,
+    pub entry_price: Decimal,
+    pub amount_tokens: u64,
+    pub entry_time: DateTime<Utc>,
+    pub strategy: StrategyType,
+    pub buy_signature: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ATHTracker {
+    pub entry_price: Decimal,
+    pub ath_price: Decimal,
+    pub last_price: Decimal,
+    pub pullback_percent: Decimal,
+    pub min_profit_percent: Decimal,
+    pub last_updated: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub enum StrategyType {
+    Conservative,           // 15% profit, 5% stop loss
+    Aggressive,            // 50% profit, 15% stop loss  
+    ConservativeATH,       // 8% pullback, 3% min profit
+    AggressiveATH,         // 12% pullback, 5% min profit
+}
+
+#[derive(Debug, Clone)]
+pub struct TradeConfig {
+    pub token_address: String,
+    pub amount_sol: f64,
+    pub slippage_bps: u16,
+    pub strategy: StrategyType,
+}
+
+#[derive(Debug, Clone)]
+pub struct TradeResult {
+    pub signature: String,
+    pub success: bool,
+    pub error: Option<String>,
+    pub execution_time_ms: u64,
+    pub platform_used: Platform,
+    pub tokens_received: Option<u64>,
+    pub sol_spent: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Platform {
+    PumpFun,
+    Raydium,
+    Jupiter,
+}
+
+// Known token addresses for common pairs
+pub mod token_addresses {
+    pub const SOL: &str = "So11111111111111111111111111111111111111112";
+    pub const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    pub const BONK: &str = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
+    pub const USDT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+    pub const JUP: &str = "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN";
+}
+
+// Program IDs for direct DEX interaction
+pub mod program_ids {
+    use solana_sdk::pubkey::Pubkey;
+    use std::str::FromStr;
+    
+    pub fn jupiter_v6() -> Pubkey {
+        Pubkey::from_str("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4").unwrap()
+    }
+    
+    pub fn raydium_amm_v4() -> Pubkey {
+        Pubkey::from_str("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8").unwrap()
+    }
+    
+    pub fn pumpfun() -> Pubkey {
+        Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap()
+    }
+}
+
+impl FastMemeTrader {
+    // Ultra-fast initialization
+    pub fn new(private_key: &str, helius_api_key: String) -> Result<Self> {
+        log::info!("Initializing FastMemeTrader...");
+        
+        let keypair = Keypair::from_base58_string(private_key);
+        log::info!("Wallet: {}", keypair.pubkey());
+        
+        let rpc_url = format!("https://mainnet.helius-rpc.com/?api-key={}", helius_api_key);
+        let rpc_client = RpcClient::new_with_commitment(
+            rpc_url,
+            CommitmentConfig::processed(),
+        );
+
+        let trader = Self {
+            rpc_client,
+            keypair,
+            helius_api_key,
+            jupiter_endpoint: "https://quote-api.jup.ag/v6".to_string(),
+            max_priority_fee: 200_000,
+            positions: Arc::new(RwLock::new(HashMap::new())),
+            ath_tracker: Arc::new(RwLock::new(HashMap::new())),
+            jupiter_program_id: program_ids::jupiter_v6(),
+            raydium_amm_program_id: program_ids::raydium_amm_v4(),
+            pumpfun_program_id: program_ids::pumpfun(),
+        };
+        
+        log::info!("FastMemeTrader initialized successfully");
+        Ok(trader)
+    }
+
+    // Fast platform detection with parallel checks
+    pub async fn detect_best_platform(&self, token_address: &str) -> Platform {
+        log::debug!("Detecting best platform for token: {}", token_address);
+        
+        let (pumpfun_check, raydium_check) = tokio::join!(
+            self.is_pumpfun_token(token_address),
+            self.has_raydium_liquidity(token_address)
+        );
+        
+        let platform = if pumpfun_check {
+            Platform::PumpFun
+        } else if raydium_check {
+            Platform::Raydium  
+        } else {
+            Platform::Jupiter
+        };
+        
+        log::info!("Selected platform: {:?} for token {}", platform, &token_address[..8]);
+        platform
+    }
+
+    // Fast buy with automatic platform selection
+    pub async fn buy_fast(&self, config: TradeConfig) -> TradeResult {
+        let start_time = Instant::now();
+        
+        log::info!("Starting fast buy: {} SOL for {}", config.amount_sol, &config.token_address[..8]);
+        
+        // Validate input
+        if config.amount_sol < 0.001 || config.amount_sol > 50.0 {
+            return TradeResult {
+                signature: String::new(),
+                success: false,
+                error: Some("Amount must be between 0.001 and 50.0 SOL".to_string()),
+                execution_time_ms: start_time.elapsed().as_millis() as u64,
+                platform_used: Platform::Jupiter,
+                tokens_received: None,
+                sol_spent: None,
+            };
+        }
+        
+        let platform = self.detect_best_platform(&config.token_address).await;
+        
+        let result = match platform {
+            Platform::PumpFun => self.buy_pumpfun(&config).await,
+            Platform::Raydium => self.buy_raydium(&config).await,
+            Platform::Jupiter => self.buy_jupiter(&config).await,
+        };
+        
+        let execution_time = start_time.elapsed().as_millis() as u64;
+        
+        match result {
+            Ok((signature, tokens_received)) => {
+                log::info!("Buy successful: {} tokens received in {}ms", tokens_received, execution_time);
+                
+                // Initialize position and ATH tracking
+                self.initialize_position(&config, &signature, tokens_received).await;
+                
+                TradeResult {
+                    signature,
+                    success: true,
+                    error: None,
+                    execution_time_ms: execution_time,
+                    platform_used: platform,
+                    tokens_received: Some(tokens_received),
+                    sol_spent: Some(config.amount_sol),
+                }
+            },
+            Err(e) => {
+                log::error!("Buy failed after {}ms: {}", execution_time, e);
+                TradeResult {
+                    signature: String::new(),
+                    success: false,
+                    error: Some(e.to_string()),
+                    execution_time_ms: execution_time,
+                    platform_used: platform,
+                    tokens_received: None,
+                    sol_spent: None,
+                }
+            },
+        }
+    }
+
+    // Complete Jupiter implementation
+    async fn buy_jupiter(&self, config: &TradeConfig) -> Result<(String, u64)> {
+        log::info!("Executing Jupiter buy for {}", &config.token_address[..8]);
+        
+        let amount_lamports = (config.amount_sol * LAMPORTS_PER_SOL as f64) as u64;
+        
+        // 1. Get quote with timeout
+        let quote = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.get_jupiter_quote(config, amount_lamports)
+        ).await??;
+        
+        let tokens_expected = quote["outAmount"].as_str()
+            .ok_or_else(|| anyhow!("No outAmount in quote"))?
+            .parse::<u64>()?;
+        
+        log::info!("Jupiter quote: {} lamports -> {} tokens", amount_lamports, tokens_expected);
+        
+        // 2. Get swap transaction
+        let priority_fee = self.calculate_priority_fee().await;
+        let swap_data = json!({
+            "userPublicKey": self.keypair.pubkey().to_string(),
+            "quoteResponse": quote,
+            "prioritizationFeeLamports": priority_fee,
+            "asLegacyTransaction": false,
+            "dynamicComputeUnitLimit": true,
+            "dynamicSlippageReport": true,
+        });
+        
+        let swap_data_str = serde_json::to_string(&swap_data)?;
+        let url = format!("{}/swap", self.jupiter_endpoint);
+        
+        let response = tokio::task::spawn_blocking(move || {
+            ureq::post(&url)
+                .timeout_connect(15_000)
+                .timeout_read(15_000)
+                .set("Content-Type", "application/json")
+                .send_string(&swap_data_str)
+        }).await??;
+        
+        if !response.status().is_success() {
+            let error_text = response.into_string()?;
+            return Err(anyhow!("Jupiter swap API error: {}", error_text));
+        }
+        
+        let swap_result: Value = response.into_json()?;
+        let transaction_b64 = swap_result["swapTransaction"].as_str()
+            .ok_or_else(|| anyhow!("No transaction returned from Jupiter"))?;
+        
+        // 3. Execute transaction
+        let signature = self.execute_transaction_b64(transaction_b64).await?;
+        
+        Ok((signature, tokens_expected))
+    }
+
+    // Complete PumpFun implementation
+    async fn buy_pumpfun(&self, config: &TradeConfig) -> Result<(String, u64)> {
+        log::info!("Executing PumpFun buy for {}", &config.token_address[..8]);
+        
+        let amount_lamports = (config.amount_sol * LAMPORTS_PER_SOL as f64) as u64;
+        
+        // Use PumpPortal API for transaction generation
+        let pumpfun_data = json!({
+            "publicKey": self.keypair.pubkey().to_string(),
+            "action": "buy",
+            "mint": config.token_address,
+            "denominatedInSol": "true",
+            "amount": amount_lamports,
+            "slippage": config.slippage_bps,
+            "priorityFee": self.calculate_priority_fee().await,
+            "pool": "pump"
+        });
+        
+        let pumpfun_data_str = serde_json::to_string(&pumpfun_data)?;
+        
+        let response = tokio::task::spawn_blocking(move || {
+            ureq::post("https://pumpportal.fun/api/trade-local")
+                .timeout_connect(15_000)
+                .timeout_read(15_000)
+                .set("Content-Type", "application/json")
+                .send_string(&pumpfun_data_str)
+        }).await??;
+        
+        if !response.status().is_success() {
+            let error_text = response.into_string()?;
+            return Err(anyhow!("PumpFun API error: {}", error_text));
+        }
+        
+        let transaction_b64 = response.into_string()?;
+        let signature = self.execute_transaction_b64(&transaction_b64).await?;
+        
+        // Estimate tokens received (would need actual curve calculation)
+        let tokens_estimated = amount_lamports;
+        
+        Ok((signature, tokens_estimated))
+    }
+
+    // Raydium implementation (framework ready)
+    async fn buy_raydium(&self, config: &TradeConfig) -> Result<(String, u64)> {
+        log::info!("Raydium buy requested for {}", &config.token_address[..8]);
+        
+        // For now, fall back to Jupiter since Raydium SDK integration is complex
+        log::warn!("Raydium integration not complete, falling back to Jupiter");
+        self.buy_jupiter(config).await
+    }
+
+    // Execute base64 encoded transaction
+    async fn execute_transaction_b64(&self, transaction_b64: &str) -> Result<String> {
+        log::debug!("Executing transaction from base64");
+        
+        let transaction_bytes = base64::engine::general_purpose::STANDARD.decode(transaction_b64)?;
+        let mut transaction: Transaction = bincode::deserialize(&transaction_bytes)?;
+        
+        // Re-sign transaction with fresh blockhash
+        let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
+        transaction.sign(&[&self.keypair], recent_blockhash);
+        
+        let signature = self.send_with_retry(transaction).await?;
+        Ok(signature.to_string())
+    }
+
+    // Robust transaction sending with retry logic
+    async fn send_with_retry(&self, transaction: Transaction) -> Result<Signature> {
+        let mut last_error = None;
+        
+        for attempt in 1..=5 {
+            log::debug!("Sending transaction attempt {}/5", attempt);
+            
+            match self.rpc_client.send_and_confirm_transaction(&transaction) {
+                Ok(signature) => {
+                    log::info!("Transaction confirmed: {}", signature);
+                    return Ok(signature);
+                },
+                Err(e) => {
+                    log::warn!("Transaction attempt {} failed: {}", attempt, e);
+                    last_error = Some(e);
+                    
+                    if attempt < 5 {
+                        let delay = Duration::from_millis(300 * attempt);
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+        
+        Err(anyhow!("Transaction failed after 5 attempts: {:?}", last_error))
+    }
+
+    // Get Jupiter quote with optimized parameters
+    async fn get_jupiter_quote(&self, config: &TradeConfig, amount_lamports: u64) -> Result<Value> {
+        let url = format!(
+            "{}/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}&onlyDirectRoutes=false&maxAccounts=30&minimizeSlippage=true",
+            self.jupiter_endpoint,
+            token_addresses::SOL,
+            config.token_address,
+            amount_lamports,
+            config.slippage_bps
+        );
+        
+        let response = tokio::task::spawn_blocking(move || {
+            ureq::get(&url)
+                .timeout_connect(8_000)
+                .timeout_read(8_000)
+                .call()
+        }).await??;
+        
+        if !response.status().is_success() {
+            let error_text = response.into_string()?;
+            return Err(anyhow!("Jupiter quote API error: {}", error_text));
+        }
+        
+        Ok(response.into_json()?)
+    }
+
+    // Initialize position with strategy tracking
+    async fn initialize_position(&self, config: &TradeConfig, signature: &str, tokens_received: u64) {
+        let current_price = self.get_current_price(&config.token_address).await
+            .unwrap_or(Decimal::from(0));
+        
+        log::info!("Initializing position at price ${:.8}", current_price);
+        
+        let position = Position {
+            token_address: config.token_address.clone(),
+            entry_price: current_price,
+            amount_tokens: tokens_received,
+            entry_time: Utc::now(),
+            strategy: config.strategy.clone(),
+            buy_signature: signature.to_string(),
+        };
+        
+        let ath_tracker = match config.strategy {
+            StrategyType::ConservativeATH => ATHTracker {
+                entry_price: current_price,
+                ath_price: current_price,
+                last_price: current_price,
+                pullback_percent: Decimal::from(8),
+                min_profit_percent: Decimal::from(3),
+                last_updated: Utc::now(),
+            },
+            StrategyType::AggressiveATH => ATHTracker {
+                entry_price: current_price,
+                ath_price: current_price,
+                last_price: current_price,
+                pullback_percent: Decimal::from(12),
+                min_profit_percent: Decimal::from(5),
+                last_updated: Utc::now(),
+            },
+            _ => ATHTracker {
+                entry_price: current_price,
+                ath_price: current_price,
+                last_price: current_price,
+                pullback_percent: Decimal::from(10),
+                min_profit_percent: Decimal::from(2),
+                last_updated: Utc::now(),
+            },
+        };
+        
+        {
+            let mut positions = self.positions.write().await;
+            positions.insert(config.token_address.clone(), position);
+        }
+        {
+            let mut trackers = self.ath_tracker.write().await;
+            trackers.insert(config.token_address.clone(), ath_tracker);
+        }
+        
+        log::info!("Position and ATH tracker initialized for strategy: {:?}", config.strategy);
+    }
+
+    // Monitor positions and execute strategies
+    pub async fn monitor_positions(&self) -> Vec<String> {
+        let mut executed_sells = Vec::new();
+        let positions: Vec<_> = {
+            let positions_guard = self.positions.read().await;
+            positions_guard.values().cloned().collect()
+        };
+        
+        for position in positions {
+            if let Ok(current_price) = self.get_current_price(&position.token_address).await {
+                let should_sell = self.evaluate_exit_strategy(&position, current_price).await;
+                
+                if should_sell {
+                    log::info!("Exit strategy triggered for {}", &position.token_address[..8]);
+                    
+                    if let Ok(sell_result) = self.sell_position(&position.token_address).await {
+                        let message = format!(
+                            "Sold {} - Signature: {} - Strategy: {:?} - Time: {}ms",
+                            &position.token_address[..8], 
+                            sell_result.signature, 
+                            position.strategy,
+                            sell_result.execution_time_ms
+                        );
+                        executed_sells.push(message);
+                        
+                        // Clean up position and tracker
+                        {
+                            let mut positions_guard = self.positions.write().await;
+                            positions_guard.remove(&position.token_address);
+                        }
+                        {
+                            let mut trackers_guard = self.ath_tracker.write().await;
+                            trackers_guard.remove(&position.token_address);
+                        }
+                    }
+                }
+            }
+        }
+        
+        executed_sells
+    }
+
+    // Strategy evaluation with ATH logic
+    async fn evaluate_exit_strategy(&self, position: &Position, current_price: Decimal) -> bool {
+        // Update ATH tracker
+        {
+            let mut trackers = self.ath_tracker.write().await;
+            if let Some(tracker) = trackers.get_mut(&position.token_address) {
+                if current_price > tracker.ath_price {
+                    tracker.ath_price = current_price;
+                    log::debug!("New ATH for {}: ${:.8}", &position.token_address[..8], current_price);
+                }
+                tracker.last_price = current_price;
+                tracker.last_updated = Utc::now();
+            }
+        }
+        
+        match position.strategy {
+            StrategyType::Conservative => {
+                let profit_percent = self.calculate_profit_percent(position.entry_price, current_price);
+                profit_percent >= Decimal::from(15) || profit_percent <= Decimal::from(-5)
+            },
+            StrategyType::Aggressive => {
+                let profit_percent = self.calculate_profit_percent(position.entry_price, current_price);
+                profit_percent >= Decimal::from(50) || profit_percent <= Decimal::from(-15)
+            },
+            StrategyType::ConservativeATH | StrategyType::AggressiveATH => {
+                self.check_ath_pullback_exit(&position.token_address, current_price).await
+            },
+        }
+    }
+
+    // ATH pullback exit logic
+    async fn check_ath_pullback_exit(&self, token_address: &str, current_price: Decimal) -> bool {
+        let trackers = self.ath_tracker.read().await;
+        if let Some(tracker) = trackers.get(token_address) {
+            let profit_percent = self.calculate_profit_percent(tracker.entry_price, current_price);
+            let pullback_from_ath = if tracker.ath_price != Decimal::ZERO {
+                (tracker.ath_price - current_price) / tracker.ath_price * Decimal::from(100)
+            } else {
+                Decimal::ZERO
+            };
+            
+            let should_exit = profit_percent >= tracker.min_profit_percent 
+                && pullback_from_ath >= tracker.pullback_percent;
+            
+            if should_exit {
+                log::info!(
+                    "ATH pullback triggered for {}: Profit: {:.2}%, Pullback: {:.2}%, ATH: ${:.8}",
+                    &token_address[..8], profit_percent, pullback_from_ath, tracker.ath_price
+                );
+            }
+            
+            should_exit
+        } else {
+            false
+        }
+    }
+
+    // Fast sell implementation
+    pub async fn sell_position(&self, token_address: &str) -> Result<TradeResult> {
+        let start_time = Instant::now();
+        
+        log::info!("Starting sell for {}", &token_address[..8]);
+        
+        let token_balance = self.get_token_balance(token_address).await?;
+        if token_balance == 0 {
+            return Err(anyhow!("No tokens to sell"));
+        }
+        
+        log::info!("Selling {} tokens", token_balance);
+        
+        // Use Jupiter for selling (most reliable)
+        let result = self.sell_jupiter(token_address, token_balance).await;
+        let execution_time = start_time.elapsed().as_millis() as u64;
+        
+        match result {
+            Ok(signature) => Ok(TradeResult {
+                signature,
+                success: true,
+                error: None,
+                execution_time_ms: execution_time,
+                platform_used: Platform::Jupiter,
+                tokens_received: None,
+                sol_spent: None,
+            }),
+            Err(e) => Ok(TradeResult {
+                signature: String::new(),
+                success: false,
+                error: Some(e.to_string()),
+                execution_time_ms: execution_time,
+                platform_used: Platform::Jupiter,
+                tokens_received: None,
+                sol_spent: None,
+            }),
+        }
+    }
+
+    // Jupiter sell implementation
+    async fn sell_jupiter(&self, token_address: &str, amount: u64) -> Result<String> {
+        let quote_url = format!(
+            "{}/quote?inputMint={}&outputMint={}&amount={}&slippageBps=300&onlyDirectRoutes=false",
+            self.jupiter_endpoint,
+            token_address,
+            token_addresses::SOL,
+            amount
+        );
+        
+        let quote: Value = tokio::task::spawn_blocking(move || {
+            ureq::get(&quote_url)
+                .timeout_connect(10_000)
+                .timeout_read(10_000)
+                .call()
+        }).await??.into_json()?;
+        
+        let swap_data = json!({
+            "userPublicKey": self.keypair.pubkey().to_string(),
+            "quoteResponse": quote,
+            "prioritizationFeeLamports": self.calculate_priority_fee().await,
+            "asLegacyTransaction": false,
+        });
+        
+        let swap_data_str = serde_json::to_string(&swap_data)?;
+        let swap_url = format!("{}/swap", self.jupiter_endpoint);
+        
+        let swap_result: Value = tokio::task::spawn_blocking(move || {
+            ureq::post(&swap_url)
+                .timeout_connect(10_000)
+                .timeout_read(10_000)
+                .set("Content-Type", "application/json")
+                .send_string(&swap_data_str)
+        }).await??.into_json()?;
+        
+        let transaction_b64 = swap_result["swapTransaction"].as_str()
+            .ok_or_else(|| anyhow!("No transaction returned"))?;
+        
+        self.execute_transaction_b64(transaction_b64).await
+    }
+
+    // Helper methods
+    async fn calculate_priority_fee(&self) -> u64 {
+        let url = format!("https://mainnet.helius-rpc.com/?api-key={}", self.helius_api_key);
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "getPriorityFeeEstimate",
+            "params": [{
+                "options": { "priorityLevel": "Medium" }
+            }]
+        });
+        
+        let request_body_str = serde_json::to_string(&request_body).unwrap_or_default();
+        
+        if let Ok(response) = tokio::task::spawn_blocking(move || {
+            ureq::post(&url)
+                .timeout_connect(3_000)
+                .timeout_read(3_000)
+                .set("Content-Type", "application/json")
+                .send_string(&request_body_str)
+        }).await {
+            if let Ok(response) = response {
+                if let Ok(data) = response.into_json::<Value>() {
+                    if let Some(fee) = data["result"]["priorityFeeEstimate"].as_f64() {
+                        return (fee as u64).min(self.max_priority_fee);
+                    }
+                }
+            }
+        }
+        
+        100_000 // Fallback fee
+    }
+
+    async fn is_pumpfun_token(&self, token_address: &str) -> bool {
+        let url = format!("https://frontend-api.pump.fun/coins/{}", token_address);
+        
+        match tokio::task::spawn_blocking(move || {
+            ureq::get(&url)
+                .timeout_connect(1_000)
+                .timeout_read(1_000)
+                .call()
+        }).await {
+            Ok(Ok(response)) => response.status().is_success(),
+            _ => false,
+        }
+    }
+
+    async fn has_raydium_liquidity(&self, _token_address: &str) -> bool {
+        // Simplified check - would need actual Raydium integration
+        false
+    }
+
+    async fn get_current_price(&self, token_address: &str) -> Result<Decimal> {
+        let url = format!("https://price.jup.ag/v4/price?ids={}", token_address);
+        
+        let response: Value = tokio::task::spawn_blocking(move || {
+            ureq::get(&url)
+                .timeout_connect(3_000)
+                .timeout_read(3_000)
+                .call()
+        }).await??.into_json()?;
+        
+        if let Some(price_value) = response["data"][token_address]["price"].as_f64() {
+            Ok(Decimal::try_from(price_value)?)
+        } else {
+            Err(anyhow!("Price not found"))
+        }
+    }
+
+    async fn get_token_balance(&self, token_address: &str) -> Result<u64> {
+        let mint = Pubkey::from_str(token_address)?;
+        let ata = get_associated_token_address(&self.keypair.pubkey(), &mint);
+        
+        match self.rpc_client.get_token_account_balance(&ata) {
+            Ok(balance) => Ok(balance.amount.parse()?),
+            Err(_) => Ok(0),
+        }
+    }
+
+    fn calculate_profit_percent(&self, entry_price: Decimal, current_price: Decimal) -> Decimal {
+        if entry_price == Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+        (current_price - entry_price) / entry_price * Decimal::from(100)
+    }
+
+    // Status and monitoring methods
+    pub async fn get_ath_status(&self, token_address: &str) -> Option<String> {
+        let trackers = self.ath_tracker.read().await;
+        if let Some(tracker) = trackers.get(token_address) {
+            let profit_percent = self.calculate_profit_percent(tracker.entry_price, tracker.last_price);
+            let pullback_from_ath = if tracker.ath_price != Decimal::ZERO {
+                (tracker.ath_price - tracker.last_price) / tracker.ath_price * Decimal::from(100)
+            } else {
+                Decimal::ZERO
+            };
+            
+            Some(format!(
+                "Entry: ${:.8} | ATH: ${:.8} | Current: ${:.8} | P&L: {:.2}% | Pullback: {:.2}%",
+                tracker.entry_price, tracker.ath_price, tracker.last_price, 
+                profit_percent, pullback_from_ath
+            ))
+        } else {
+            None
+        }
+    }
+
+    pub async fn list_positions(&self) -> Vec<String> {
+        let positions = self.positions.read().await;
+        let mut result = Vec::new();
+        
+        for (token, position) in positions.iter() {
+            if let Ok(current_price) = self.get_current_price(token).await {
+                let profit_percent = self.calculate_profit_percent(position.entry_price, current_price);
+                result.push(format!(
+                    "{}: {:.0} tokens | Entry: ${:.8} | Current: ${:.8} | P&L: {:.2}% | Strategy: {:?}",
+                    &token[..8], position.amount_tokens, position.entry_price, current_price, 
+                    profit_percent, position.strategy
+                ));
+            }
+        }
+        
+        result
+    }
+
+    pub async fn emergency_sell_all(&self) -> Vec<TradeResult> {
+        log::warn!("EMERGENCY SELL ALL initiated");
+        
+        let mut results = Vec::new();
+        let positions: Vec<_> = {
+            let positions_guard = self.positions.read().await;
+            positions_guard.keys().cloned().collect()
+        };
+        
+        for token_address in positions {
+            log::warn!("Emergency selling {}", &token_address[..8]);
+            if let Ok(result) = self.sell_position(&token_address).await {
+                results.push(result);
+            }
+        }
+        
+        // Clear all positions
+        {
+            let mut positions_guard = self.positions.write().await;
+            positions_guard.clear();
+        }
+        {
+            let mut trackers_guard = self.ath_tracker.write().await;
+            trackers_guard.clear();
+        }
+        
+        log::warn!("Emergency sell completed, {} positions liquidated", results.len());
+        results
+    }
+
+    // Quick health check
+    pub async fn health_check(&self) -> Result<String> {
+        // Check SOL balance
+        let sol_balance = self.rpc_client.get_balance(&self.keypair.pubkey())?;
+        let sol_amount = sol_balance as f64 / LAMPORTS_PER_SOL as f64;
+        
+        // Check positions count
+        let positions_count = self.positions.read().await.len();
+        
+        // Test Jupiter connectivity
+        let jupiter_test = self.get_current_price(token_addresses::BONK).await.is_ok();
+        
+        Ok(format!(
+            "Health: SOL Balance: {:.6} | Positions: {} | Jupiter: {}",
+            sol_amount, positions_count, if jupiter_test { "✅" } else { "❌" }
+        ))
+    }
+}
+
+// Simple example usage function
+pub async fn example_usage() -> Result<()> {
+    env_logger::init();
+    dotenv::dotenv().ok();
+    
+    let private_key = std::env::var("WALLET_PRIVATE_KEY")?;
+    let helius_api_key = std::env::var("HELIUS_API_KEY")?;
+    
+    let trader = FastMemeTrader::new(&private_key, helius_api_key)?;
+    
+    // Example: Buy BONK with Conservative ATH strategy
+    let config = TradeConfig {
+        token_address: token_addresses::BONK.to_string(),
+        amount_sol: 0.1,
+        slippage_bps: 100,
+        strategy: StrategyType::ConservativeATH,
+    };
+    
+    let result = trader.buy_fast(config).await;
+    println!("Buy result: {:#?}", result);
+    
+    if result.success {
+        // Monitor positions
+        loop {
+            let sells = trader.monitor_positions().await;
+            for sell in sells {
+                println!("Executed sell: {}", sell);
+            }
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+    }
+    
+    Ok(())
+}
