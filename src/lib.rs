@@ -9,7 +9,7 @@ use solana_sdk::{
     transaction::Transaction,
     native_token::LAMPORTS_PER_SOL,
 };
-use base64::Engine; // FIX: Added missing Engine trait import
+use base64::Engine;
 use spl_associated_token_account::get_associated_token_address;
 use serde_json::{json, Value};
 use std::str::FromStr;
@@ -32,11 +32,6 @@ pub struct FastMemeTrader {
     // Strategy tracking
     pub positions: Arc<RwLock<HashMap<String, Position>>>,
     ath_tracker: Arc<RwLock<HashMap<String, ATHTracker>>>,
-    
-    // Program IDs for direct DEX interaction
-    jupiter_program_id: Pubkey,
-    raydium_amm_program_id: Pubkey,
-    pumpfun_program_id: Pubkey,
 }
 
 #[derive(Debug, Clone)]
@@ -102,30 +97,13 @@ pub mod token_addresses {
     pub const JUP: &str = "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN";
 }
 
-// Program IDs for direct DEX interaction
-pub mod program_ids {
-    use solana_sdk::pubkey::Pubkey;
-    use std::str::FromStr;
-    
-    pub fn jupiter_v6() -> Pubkey {
-        Pubkey::from_str("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4").unwrap()
-    }
-    
-    pub fn raydium_amm_v4() -> Pubkey {
-        Pubkey::from_str("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8").unwrap()
-    }
-    
-    pub fn pumpfun() -> Pubkey {
-        Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P").unwrap()
-    }
-}
-
 impl FastMemeTrader {
-    // Ultra-fast initialization
+    // Ultra-fast initialization with better key parsing
     pub fn new(private_key: &str, helius_api_key: String) -> Result<Self> {
         log::info!("Initializing FastMemeTrader...");
         
-        let keypair = Keypair::from_base58_string(private_key);
+        // Better keypair parsing with multiple format support
+        let keypair = Self::parse_private_key(private_key)?;
         log::info!("Wallet: {}", keypair.pubkey());
         
         let rpc_url = format!("https://mainnet.helius-rpc.com/?api-key={}", helius_api_key);
@@ -142,13 +120,79 @@ impl FastMemeTrader {
             max_priority_fee: 200_000,
             positions: Arc::new(RwLock::new(HashMap::new())),
             ath_tracker: Arc::new(RwLock::new(HashMap::new())),
-            jupiter_program_id: program_ids::jupiter_v6(),
-            raydium_amm_program_id: program_ids::raydium_amm_v4(),
-            pumpfun_program_id: program_ids::pumpfun(),
         };
         
         log::info!("FastMemeTrader initialized successfully");
         Ok(trader)
+    }
+
+    // Improved private key parsing with multiple format support
+    fn parse_private_key(private_key: &str) -> Result<Keypair> {
+        let trimmed_key = private_key.trim();
+        
+        // Try different key formats
+        
+        // 1. Try as base58 string (most common format)
+        if let Ok(keypair) = Keypair::from_base58_string(trimmed_key) {
+            return Ok(keypair);
+        }
+        
+        // 2. Try as JSON array (Phantom/Solflare export format)
+        if trimmed_key.starts_with('[') && trimmed_key.ends_with(']') {
+            if let Ok(bytes_vec) = serde_json::from_str::<Vec<u8>>(trimmed_key) {
+                if bytes_vec.len() == 64 {
+                    if let Ok(keypair) = Keypair::from_bytes(&bytes_vec) {
+                        return Ok(keypair);
+                    }
+                }
+            }
+        }
+        
+        // 3. Try as hex string (without 0x prefix)
+        if trimmed_key.len() == 128 || (trimmed_key.len() == 130 && trimmed_key.starts_with("0x")) {
+            let hex_str = if trimmed_key.starts_with("0x") {
+                &trimmed_key[2..]
+            } else {
+                trimmed_key
+            };
+            
+            if let Ok(bytes) = hex::decode(hex_str) {
+                if bytes.len() == 64 {
+                    if let Ok(keypair) = Keypair::from_bytes(&bytes) {
+                        return Ok(keypair);
+                    }
+                }
+            }
+        }
+        
+        // 4. Try as comma-separated bytes
+        if trimmed_key.contains(',') {
+            let parts: Result<Vec<u8>, _> = trimmed_key
+                .split(',')
+                .map(|s| s.trim().parse::<u8>())
+                .collect();
+            
+            if let Ok(bytes) = parts {
+                if bytes.len() == 64 {
+                    if let Ok(keypair) = Keypair::from_bytes(&bytes) {
+                        return Ok(keypair);
+                    }
+                }
+            }
+        }
+        
+        Err(anyhow!(
+            "Invalid private key format. Supported formats:\n\
+            1. Base58 string (most common)\n\
+            2. JSON array: [1,2,3,...,64]\n\
+            3. Hex string: 0x1a2b3c... or 1a2b3c...\n\
+            4. Comma-separated bytes: 1,2,3,...,64\n\
+            \n\
+            Your key length: {} characters\n\
+            First 10 chars: {}",
+            trimmed_key.len(),
+            &trimmed_key[..trimmed_key.len().min(10)]
+        ))
     }
 
     // Fast platform detection with parallel checks
@@ -369,7 +413,6 @@ impl FastMemeTrader {
     async fn execute_transaction_b64(&self, transaction_b64: &str) -> Result<String> {
         log::debug!("Executing transaction from base64");
         
-        // FIX: Use Engine trait properly
         let transaction_bytes = base64::engine::general_purpose::STANDARD.decode(transaction_b64)?;
         let mut transaction: Transaction = bincode::deserialize(&transaction_bytes)?;
         
