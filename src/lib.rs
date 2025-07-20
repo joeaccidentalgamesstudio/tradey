@@ -132,16 +132,20 @@ impl FastMemeTrader {
         
         // Try different key formats
         
-        // 1. Try as base58 string (most common format)
-        if let Ok(keypair) = Keypair::from_base58_string(trimmed_key) {
-            return Ok(keypair);
+        // 1. Try as base58 string (most common format) - using bs58 crate
+        if let Ok(bytes) = bs58::decode(trimmed_key).into_vec() {
+            if bytes.len() == 64 {
+                if let Ok(keypair) = Keypair::try_from(&bytes[..]) {
+                    return Ok(keypair);
+                }
+            }
         }
         
         // 2. Try as JSON array (Phantom/Solflare export format)
         if trimmed_key.starts_with('[') && trimmed_key.ends_with(']') {
             if let Ok(bytes_vec) = serde_json::from_str::<Vec<u8>>(trimmed_key) {
                 if bytes_vec.len() == 64 {
-                    if let Ok(keypair) = Keypair::from_bytes(&bytes_vec) {
+                    if let Ok(keypair) = Keypair::try_from(&bytes_vec[..]) {
                         return Ok(keypair);
                     }
                 }
@@ -158,7 +162,7 @@ impl FastMemeTrader {
             
             if let Ok(bytes) = hex::decode(hex_str) {
                 if bytes.len() == 64 {
-                    if let Ok(keypair) = Keypair::from_bytes(&bytes) {
+                    if let Ok(keypair) = Keypair::try_from(&bytes[..]) {
                         return Ok(keypair);
                     }
                 }
@@ -174,7 +178,7 @@ impl FastMemeTrader {
             
             if let Ok(bytes) = parts {
                 if bytes.len() == 64 {
-                    if let Ok(keypair) = Keypair::from_bytes(&bytes) {
+                    if let Ok(keypair) = Keypair::try_from(&bytes[..]) {
                         return Ok(keypair);
                     }
                 }
