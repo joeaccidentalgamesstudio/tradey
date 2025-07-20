@@ -267,13 +267,12 @@ impl FastMemeTrader {
         
         let response = tokio::task::spawn_blocking(move || {
             ureq::post(&url)
-                .timeout_connect(20_000)
-                .timeout_read(20_000)
+                .timeout(Duration::from_secs(20))
                 .set("Content-Type", "application/json")
                 .send_string(&swap_data_str)
         }).await??;
         
-        if !response.status().is_success() {
+        if response.status() != 200 {
             let error_text = response.into_string()?;
             return Err(anyhow!("Jupiter swap API error: {}", error_text));
         }
@@ -330,13 +329,12 @@ impl FastMemeTrader {
         
         let response = tokio::task::spawn_blocking(move || {
             ureq::post("https://pumpportal.fun/api/trade-local")
-                .timeout_connect(20_000)
-                .timeout_read(20_000)
+                .timeout(Duration::from_secs(20))
                 .set("Content-Type", "application/json")
                 .send_string(&pumpfun_data_str)
         }).await??;
         
-        if !response.status().is_success() {
+        if response.status() != 200 {
             let error_text = response.into_string()?;
             return Err(anyhow!("PumpFun API error: {}", error_text));
         }
@@ -433,12 +431,11 @@ impl FastMemeTrader {
         
         let response = tokio::task::spawn_blocking(move || {
             ureq::get(&url)
-                .timeout_connect(10_000)
-                .timeout_read(10_000)
+                .timeout(Duration::from_secs(10))
                 .call()
         }).await??;
         
-        if !response.status().is_success() {
+        if response.status() != 200 {
             let error_text = response.into_string()?;
             return Err(anyhow!("Jupiter quote API error: {}", error_text));
         }
@@ -663,8 +660,7 @@ impl FastMemeTrader {
         
         let quote: Value = tokio::task::spawn_blocking(move || {
             ureq::get(&quote_url)
-                .timeout_connect(15_000)
-                .timeout_read(15_000)
+                .timeout(Duration::from_secs(15))
                 .call()
         }).await??.into_json()?;
         
@@ -681,8 +677,7 @@ impl FastMemeTrader {
         
         let swap_result: Value = tokio::task::spawn_blocking(move || {
             ureq::post(&swap_url)
-                .timeout_connect(15_000)
-                .timeout_read(15_000)
+                .timeout(Duration::from_secs(15))
                 .set("Content-Type", "application/json")
                 .send_string(&swap_data_str)
         }).await??.into_json()?;
@@ -709,8 +704,7 @@ impl FastMemeTrader {
         
         if let Ok(response) = tokio::task::spawn_blocking(move || {
             ureq::post(&url)
-                .timeout_connect(5_000)
-                .timeout_read(5_000)
+                .timeout(Duration::from_secs(5))
                 .set("Content-Type", "application/json")
                 .send_string(&request_body_str)
         }).await {
@@ -735,12 +729,11 @@ impl FastMemeTrader {
         
         match tokio::task::spawn_blocking(move || {
             ureq::get(&url)
-                .timeout_connect(2_000)
-                .timeout_read(2_000)
+                .timeout(Duration::from_secs(2))
                 .call()
         }).await {
             Ok(Ok(response)) => {
-                let is_pumpfun = response.status().is_success();
+                let is_pumpfun = response.status() == 200;
                 log::debug!("PumpFun check for {}: {}", &token_address[..8], is_pumpfun);
                 is_pumpfun
             },
@@ -773,8 +766,7 @@ impl FastMemeTrader {
         
         let response: Value = tokio::task::spawn_blocking(move || {
             ureq::get(&url)
-                .timeout_connect(5_000)
-                .timeout_read(5_000)
+                .timeout(Duration::from_secs(5))
                 .call()
         }).await??.into_json()?;
         
@@ -790,8 +782,7 @@ impl FastMemeTrader {
         
         let response: Value = tokio::task::spawn_blocking(move || {
             ureq::get(&url)
-                .timeout_connect(5_000)
-                .timeout_read(5_000)
+                .timeout(Duration::from_secs(5))
                 .set("X-API-KEY", "your-birdeye-api-key") // Replace with actual API key
                 .call()
         }).await??.into_json()?;

@@ -4,6 +4,7 @@ use fast_meme_trader::{FastMemeTrader, TradeConfig, StrategyType, token_addresse
 use anyhow::Result;
 use std::io::{self, Write};
 use std::time::Duration;
+use solana_sdk::signature::Signer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -151,7 +152,7 @@ async fn quick_buy(trader: &FastMemeTrader) -> Result<()> {
         token_address: token_address.clone(),
         amount_sol,
         slippage_bps,
-        strategy,
+        strategy: strategy.clone(),
     };
     
     let result = trader.buy_fast(config).await;
