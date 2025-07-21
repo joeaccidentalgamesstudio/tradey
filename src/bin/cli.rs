@@ -1,18 +1,19 @@
-// src/bin/cli.rs - Command Line Interface for the trading bot
+// src/bin/cli.rs - FIXED Command Line Interface for the trading bot
 
 use fast_meme_trader::{FastMemeTrader, TradeConfig, StrategyType, token_addresses};
 use anyhow::Result;
 use std::io::{self, Write};
 use std::time::Duration;
-use solana_sdk::signature::Signer;
+use solana_sdk::{signature::Signer, pubkey::Pubkey};
+use std::str::FromStr;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
     dotenv::dotenv().ok();
     
-    println!("🚀 Fast Solana Meme Coin Trading Bot v0.3.1");
-    println!("===============================================");
+    println!("🚀 Fast Solana Meme Coin Trading Bot v0.3.1 - FIXED");
+    println!("====================================================");
     
     // Initialize trader
     let private_key = std::env::var("WALLET_PRIVATE_KEY")
@@ -73,10 +74,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+// FIXED: Enhanced quick_buy with comprehensive validation
 async fn quick_buy(trader: &FastMemeTrader) -> Result<()> {
-    println!("\n🚀 Quick Buy Setup");
+    println!("\n🚀 Quick Buy Setup - ENHANCED VALIDATION");
     
-    // Get token address
+    // Get token address with better validation
     print!("Enter token address (or 'bonk' for BONK, 'usdc' for USDC): ");
     io::stdout().flush()?;
     let mut token_input = String::new();
@@ -89,30 +91,43 @@ async fn quick_buy(trader: &FastMemeTrader) -> Result<()> {
         addr => addr.to_string(),
     };
     
-    // Validate token address format
+    // FIXED: Enhanced token address validation
     if token_address.len() != 44 {
-        println!("❌ Invalid token address format");
+        println!("❌ Invalid token address length: expected 44 characters, got {}", token_address.len());
+        println!("💡 Example valid address: DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263");
         return Ok(());
     }
     
-    // Get amount
-    print!("Enter SOL amount (0.001 - 10.0): ");
+    // Test if we can parse the address as a valid Pubkey
+    if let Err(e) = Pubkey::from_str(&token_address) {
+        println!("❌ Invalid token address format: {}", e);
+        println!("💡 Make sure it's a valid base58 Solana address");
+        return Ok(());
+    }
+    
+    println!("✅ Token address validated: {}", &token_address[..8]);
+    
+    // FIXED: Enhanced amount validation with better limits
+    print!("Enter SOL amount (0.000001 - 10.0): ");
     io::stdout().flush()?;
     let mut amount_input = String::new();
     io::stdin().read_line(&mut amount_input)?;
     let amount_sol: f64 = amount_input.trim().parse()
-        .map_err(|_| anyhow::anyhow!("Invalid amount"))?;
+        .map_err(|_| anyhow::anyhow!("Invalid amount - please enter a number"))?;
     
-    if amount_sol < 0.001 || amount_sol > 10.0 {
-        println!("❌ Amount must be between 0.001 and 10.0 SOL");
+    if amount_sol < 0.000001 || amount_sol > 10.0 {
+        println!("❌ Amount must be between 0.000001 and 10.0 SOL");
+        println!("💡 Minimum: 0.000001 SOL (~$0.0002), Maximum: 10.0 SOL");
         return Ok(());
     }
+    
+    println!("✅ Amount validated: {} SOL", amount_sol);
     
     // Get strategy
     println!("\nSelect strategy:");
     println!("1. 💚 Conservative (15% profit, 5% stop loss)");
     println!("2. 🔥 Aggressive (50% profit, 15% stop loss)");
-    println!("3. 🎯 Conservative ATH (8% pullback, 3% min profit)");
+    println!("3. 🎯 Conservative ATH (8% pullback, 3% min profit) - RECOMMENDED");
     println!("4. ⚡ Aggressive ATH (12% pullback, 5% min profit)");
     print!("Choice (1-4): ");
     io::stdout().flush()?;
@@ -125,28 +140,51 @@ async fn quick_buy(trader: &FastMemeTrader) -> Result<()> {
         "3" => StrategyType::ConservativeATH,
         "4" => StrategyType::AggressiveATH,
         _ => {
-            println!("❌ Invalid choice, using Conservative ATH");
+            println!("❌ Invalid choice, using Conservative ATH (recommended)");
             StrategyType::ConservativeATH
         }
     };
     
-    // Get slippage
-    print!("Enter slippage % (default 1.0): ");
+    println!("✅ Strategy selected: {:?}", strategy);
+    
+    // FIXED: Enhanced slippage validation
+    print!("Enter slippage % (default 1.0, range 0.1-50.0): ");
     io::stdout().flush()?;
     let mut slippage_input = String::new();
     io::stdin().read_line(&mut slippage_input)?;
     let slippage_percent: f64 = if slippage_input.trim().is_empty() {
         1.0
     } else {
-        slippage_input.trim().parse().unwrap_or(1.0)
+        match slippage_input.trim().parse::<f64>() {
+            Ok(val) => {
+                if val < 0.1 {
+                    println!("⚠️  Slippage too low, using minimum 0.1%");
+                    0.1
+                } else if val > 50.0 {
+                    println!("⚠️  Slippage too high, using maximum 50.0%");
+                    50.0
+                } else {
+                    val
+                }
+            },
+            Err(_) => {
+                println!("⚠️  Invalid slippage, using default 1.0%");
+                1.0
+            }
+        }
     };
     let slippage_bps = (slippage_percent * 100.0) as u16;
     
-    println!("\n🔄 Executing buy...");
+    println!("✅ Slippage set: {}% ({} bps)", slippage_percent, slippage_bps);
+    
+    // Show confirmation
+    println!("\n🔄 EXECUTING BUY ORDER");
+    println!("=====================================");
     println!("💰 Amount: {} SOL", amount_sol);
     println!("🎯 Token: {}", token_address);
     println!("📊 Strategy: {:?}", strategy);
     println!("📈 Slippage: {}%", slippage_percent);
+    println!("=====================================");
     
     let config = TradeConfig {
         token_address: token_address.clone(),
@@ -155,20 +193,53 @@ async fn quick_buy(trader: &FastMemeTrader) -> Result<()> {
         strategy: strategy.clone(),
     };
     
+    println!("⏳ Processing... (this may take 10-30 seconds)");
     let result = trader.buy_fast(config).await;
     
     if result.success {
-        println!("✅ Buy successful!");
+        println!("\n🎉 BUY SUCCESSFUL!");
+        println!("=====================================");
         println!("📝 Signature: {}", result.signature);
         println!("⚡ Platform: {:?}", result.platform_used);
         println!("⏱️  Execution time: {}ms", result.execution_time_ms);
         if let Some(tokens) = result.tokens_received {
             println!("🪙 Tokens received: {}", tokens);
         }
-        println!("\n🎯 Position created with {:?} strategy", strategy);
+        if let Some(sol_spent) = result.sol_spent {
+            println!("💸 SOL spent: {}", sol_spent);
+        }
+        println!("=====================================");
+        println!("🎯 Position created with {:?} strategy", strategy);
         println!("💡 Use option 4 to start monitoring for auto-exit");
+        println!("💡 Use option 3 to view your position details");
     } else {
-        println!("❌ Buy failed: {}", result.error.unwrap_or("Unknown error".to_string()));
+        println!("\n❌ BUY FAILED!");
+        println!("=====================================");
+        println!("Error: {}", result.error.unwrap_or("Unknown error".to_string()));
+        println!("⏱️  Execution time: {}ms", result.execution_time_ms);
+        println!("=====================================");
+        
+        println!("\n🔧 TROUBLESHOOTING GUIDE:");
+        println!("1. ✅ Token address validation: Check if address is exactly 44 characters");
+        println!("2. 💰 Insufficient balance: Ensure you have enough SOL + gas fees");
+        println!("3. 📊 No liquidity: Token might not have enough liquidity for your trade size");
+        println!("4. ⚡ Network issues: Try again in a few seconds");
+        println!("5. 📈 Slippage too low: Try increasing slippage to 2-5%");
+        println!("6. 🎯 Token not tradeable: Some tokens may not be available on Jupiter/PumpFun");
+        
+        // Additional specific troubleshooting based on error
+        if let Some(error_msg) = &result.error {
+            if error_msg.contains("400") {
+                println!("\n🚨 API Error 400 - Specific fixes:");
+                println!("   • Token address might be invalid or not tradeable");
+                println!("   • Try with a known token like BONK first");
+                println!("   • Increase slippage tolerance");
+            } else if error_msg.contains("insufficient") {
+                println!("\n🚨 Insufficient Balance - Check:");
+                println!("   • Your SOL balance (need {} + ~0.01 SOL for fees)", amount_sol);
+                println!("   • Try with a smaller amount");
+            }
+        }
     }
     
     Ok(())
@@ -376,8 +447,9 @@ async fn emergency_sell_all(trader: &FastMemeTrader) -> Result<()> {
     Ok(())
 }
 
+// FIXED: Enhanced platform test with better error handling
 async fn platform_test(trader: &FastMemeTrader) -> Result<()> {
-    println!("\n🔧 Platform Detection Test");
+    println!("\n🔧 Platform Detection Test - ENHANCED");
     
     let test_tokens = vec![
         ("BONK", token_addresses::BONK),
@@ -387,6 +459,7 @@ async fn platform_test(trader: &FastMemeTrader) -> Result<()> {
         ("JUP", token_addresses::JUP),
     ];
     
+    println!("Testing known tokens:");
     for (name, address) in test_tokens {
         print!("Testing {}... ", name);
         io::stdout().flush()?;
@@ -396,16 +469,42 @@ async fn platform_test(trader: &FastMemeTrader) -> Result<()> {
     }
     
     println!("\n🔍 Custom Token Test");
-    print!("Enter token address to test: ");
+    print!("Enter token address to test (or press Enter to skip): ");
     io::stdout().flush()?;
     let mut token_input = String::new();
     io::stdin().read_line(&mut token_input)?;
     let token_address = token_input.trim();
     
     if !token_address.is_empty() {
+        // Validate first
+        if token_address.len() != 44 {
+            println!("❌ Invalid token address length: expected 44 characters");
+            return Ok(());
+        }
+        
+        if let Err(e) = Pubkey::from_str(token_address) {
+            println!("❌ Invalid token address format: {}", e);
+            return Ok(());
+        }
+        
         println!("🔄 Testing platform detection...");
         let platform = trader.detect_best_platform(token_address).await;
         println!("✅ Best platform for {}: {:?}", &token_address[..8], platform);
+        
+        // Test Jupiter quote capability
+        println!("🔄 Testing Jupiter quote capability...");
+        let config = TradeConfig {
+            token_address: token_address.to_string(),
+            amount_sol: 0.001,
+            slippage_bps: 100,
+            strategy: StrategyType::Conservative,
+        };
+        
+        // This is just a test - don't actually execute
+        match trader.get_jupiter_quote(&config, 1000000).await {
+            Ok(_) => println!("✅ Jupiter quote test: SUCCESS"),
+            Err(e) => println!("❌ Jupiter quote test: FAILED - {}", e),
+        }
     }
     
     Ok(())
@@ -433,8 +532,9 @@ async fn performance_stats(trader: &FastMemeTrader) -> Result<()> {
     Ok(())
 }
 
+// FIXED: Enhanced settings display
 fn show_settings() {
-    println!("\n🔧 Current Settings");
+    println!("\n🔧 Current Settings - ENHANCED");
     println!("Environment variables from .env file:");
     
     if let Ok(key) = std::env::var("WALLET_PRIVATE_KEY") {
@@ -452,31 +552,54 @@ fn show_settings() {
     println!("\n📊 Available Strategies:");
     println!("   • Conservative: 15% profit target, 5% stop loss");
     println!("   • Aggressive: 50% profit target, 15% stop loss");
-    println!("   • Conservative ATH: 8% pullback from ATH, 3% minimum profit");
+    println!("   • Conservative ATH: 8% pullback from ATH, 3% minimum profit ⭐ RECOMMENDED");
     println!("   • Aggressive ATH: 12% pullback from ATH, 5% minimum profit");
     
-    println!("\n🎯 Supported Platforms:");
+    println!("\n🎯 Supported Platforms (AUTO-DETECTED):");
     println!("   • PumpFun: For new meme coins on pump.fun");
     println!("   • Raydium: For established tokens with liquidity pools");
-    println!("   • Jupiter: DEX aggregator for best prices");
+    println!("   • Jupiter: DEX aggregator for best prices (PRIMARY)");
     
     println!("\n🪙 Known Token Shortcuts:");
-    println!("   • 'bonk' → BONK token");
-    println!("   • 'usdc' → USDC token");
-    println!("   • 'usdt' → USDT token");
-    println!("   • 'jup' → Jupiter token");
+    println!("   • 'bonk' → {} (BONK)", token_addresses::BONK);
+    println!("   • 'usdc' → {} (USDC)", token_addresses::USDC);
+    println!("   • 'usdt' → {} (USDT)", token_addresses::USDT);
+    println!("   • 'jup' → {} (JUP)", token_addresses::JUP);
     
     println!("\n⚙️ Configuration:");
     println!("   • Max trade size: 10.0 SOL");
-    println!("   • Min trade size: 0.001 SOL");
+    println!("   • Min trade size: 0.000001 SOL");
     println!("   • Default slippage: 1.0%");
+    println!("   • Slippage range: 0.1% - 50.0%");
     println!("   • Priority fee: Dynamic (High priority)");
+    println!("   • Jupiter API: v4 (Fixed)");
     
-    println!("\n💡 Tips:");
+    println!("\n🔧 RECENT FIXES:");
+    println!("   ✅ Fixed Jupiter API endpoint (v6 → v4)");
+    println!("   ✅ Enhanced token address validation");
+    println!("   ✅ Improved slippage parameter handling");
+    println!("   ✅ Better error messages and troubleshooting");
+    println!("   ✅ Enhanced platform detection logic");
+    println!("   ✅ Comprehensive input validation");
+    
+    println!("\n💡 Usage Tips:");
     println!("   • Start with small amounts (0.001-0.01 SOL)");
     println!("   • Use Conservative ATH strategy for safer trading");
     println!("   • Monitor positions regularly with option 4");
     println!("   • Keep emergency sell (option 6) in mind for quick exits");
+    println!("   • Test with known tokens (BONK, USDC) first");
+    println!("   • Use slippage 1-3% for most trades");
     
-    println!("\n📝 Edit .env file to change wallet and API settings");
+    println!("\n🚨 Common Issues & Solutions:");
+    println!("   • 400 API Error: Check token address validity, increase slippage");
+    println!("   • Insufficient balance: Ensure enough SOL + 0.01 SOL for fees");
+    println!("   • No liquidity: Try smaller amounts or different tokens");
+    println!("   • Timeout errors: Network congestion, try again");
+    
+    println!("\n📝 Setup Instructions:");
+    println!("   1. Create .env file in project root");
+    println!("   2. Add: WALLET_PRIVATE_KEY=your_private_key_here");
+    println!("   3. Add: HELIUS_API_KEY=your_helius_api_key_here");
+    println!("   4. Use 'cargo run --bin key_checker' to verify key format");
+    println!("   5. Start with 'cargo run --bin cli' for interactive trading");
 }

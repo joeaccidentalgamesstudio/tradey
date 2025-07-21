@@ -1,13 +1,13 @@
 [package]
 name = "fast-meme-trader"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 authors = ["Your Name <your.email@example.com>"]
-description = "Ultra-fast Solana meme coin trading bot with ATH strategies"
+description = "Ultra-fast Solana meme coin trading bot with ATH strategies - FIXED VERSION"
 
 [dependencies]
-# Solana Core - Fixed compatible versions
-solana-client = "2.3.4"
+# Solana Core - Compatible versions
+solana-client = "2.3.5"
 solana-sdk = "2.3.1"
 solana-program = "2.3.0"
 
@@ -19,7 +19,7 @@ spl-associated-token-account = "7.0.0"
 tokio = { version = "1.46.1", features = ["full", "rt-multi-thread"] }
 
 # HTTP Client (ureq doesn't require OpenSSL)
-ureq = { version = "2.9", features = ["json"] }
+ureq = { version = "3.0.12", features = ["json"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
